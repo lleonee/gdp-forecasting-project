@@ -1,0 +1,385 @@
+---
+title: "Forecasting Methods Group Project"
+author: "Group 21 - Anna Sándorfi 20251828, Dominik Zelger 20251804, Leon Apaydın 20251814"
+date: "2026-05-07"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Forecasting Methods Group Project
+
+## GDP Forecast of Portugal
+
+### Introduction
+
+Portugal's GDP offers an excellent case for time series forecasting. Understanding and predicting it is not only important for banks, businesses and investors, but as Erasmus students we can get to know Portugal's economy better.
+
+In this project we will apply the Box-Jenkins methodology to the Quarterly data of Portugal's GDP, for which our source is the Eurostat's database. The series covers the period from 1995 Q1 to 2025 Q4, expressed in current prices (million EUR) and is seasonally adjusted by Eurostat. The goal is to identify an appropriate ARIMA model, validate it through diagnostic checks, and produce a short-term forecast of Portugal's GDP for the coming quarters.
+
+```{r, include=FALSE}
+#importing the libraries
+library(tidyverse)
+library(eurostat)
+library(feasts)
+library(tsibble)
+library(ggplot2)
+library(ggtime)
+library(urca)
+library(fable)
+library(dplyr)
+library(tidyr)
+library(scales)
+
+#loading the data
+gdp_raw <- get_eurostat("namq_10_gdp", time_format = "date")
+#overview of the 
+view(gdp_raw)
+#filtering for Portugal's GDP, in Million Euro, with seasonal and calendar
+#adjustment
+gdp_pt <- gdp_raw %>% 
+  filter(geo == "PT", na_item == "B1GQ", unit == "CP_MEUR", s_adj == "SCA",
+         TIME_PERIOD <= as.Date("2025-10-01")) %>% # data up to 2025 Q4
+  select(TIME_PERIOD, values) %>% 
+  arrange(TIME_PERIOD)
+#creating a tsibble 
+gdp_tsibble <- gdp_pt %>% 
+  mutate(quarter = yearquarter(TIME_PERIOD)) %>% 
+  as_tsibble(index = quarter)
+```
+
+### 1. Visualisation
+
+```{r, echo = FALSE}
+#plotting the data
+autoplot(gdp_tsibble, values) +
+  labs(
+    title    = "Portugal quarterly GDP",
+    subtitle = "Current prices, million EUR (seasonally adjusted)",
+    x = "Time", y = "Million EUR"
+  )
+```
+
+From the first figure we can see that our time series has an upward trend, with some drops, regarding a smaller one at 2008, and a larger, sharp one at 2020 caused by COVID. This large drop could be handled by keeping only the values before or after 2020, but none of these would be wise decisions, since either we will have too few observations, or lose the most recent data. Another solution would be to use a dummy variable, but with that we would need to use ARIMAX later, which is out of the scope of this project.
+
+#### Splitting the data
+
+To be able to evaluate our models performance with the data it hasn't seen, we split the data before and after 2022 Q4.
+
+```{r, echo = FALSE}
+# Splitting the data: Holding out the last 2 years (8 quarters) for testing
+gdp_train <- gdp_tsibble %>% filter(quarter <= yearquarter("2022 Q4"))
+gdp_test  <- gdp_tsibble %>% filter(quarter > yearquarter("2022 Q4"))
+```
+
+```{r, echo = FALSE}
+view(gdp_test)
+```
+
+### 2. Box-Jenkins methodology
+
+The next step is to use the logarithmic transformation on the dataset. The ADF test on the log transformed series fails to reject the unit root hypothesis, confirming non-stationarity. After first differencing, the null is rejected, resulting in d = 1.
+
+```{r, echo = FALSE}
+### Step 1: Visual Inspection of the Training Data
+# We start by plotting the raw training series along with its ACF and PACF.
+gdp_train %>% 
+  gg_tsdisplay(values, plot_type = 'partial')
+
+### Step 2: Variance Stabilization (Log Transformation)
+# To stabilize the variance and interpret future differencing as growth rates, 
+# we apply a natural logarithm transformation.
+gdp_train <- gdp_train %>% 
+  mutate(log_gdp = log(values))
+
+# Inspecting the log-transformed series
+gdp_train %>% 
+  gg_tsdisplay(log_gdp, plot_type = 'partial')
+
+### Step 3: Formal Stationarity Check (ADF Test)
+# We test the log-transformed series for a unit root. 
+# We use 'selectlags = "AIC"' to let the model optimally choose the lag length.
+summary(ur.df(gdp_train$log_gdp, type = "trend", selectlags = "AIC"))
+
+### Step 4: Achieving Stationarity
+# Since the log-series is non-stationary, we take the first difference (d = 1).
+gdp_train <- gdp_train %>% 
+  mutate(diff_log_gdp = difference(log_gdp, 1)) 
+
+# Visual inspection of the differenced series
+gdp_train %>% 
+  gg_tsdisplay(diff_log_gdp, plot_type = 'partial')
+
+# Final ADF test to confirm stationarity
+summary(ur.df(na.omit(gdp_train$diff_log_gdp), type = "drift", selectlags = "AIC"))
+```
+
+### 3. Model Estimation and Selection
+
+By analyzing the ACF and PACF plots, we identified several suitable candidate models. Since the dataset is already seasonally adjusted by Eurostat, we manually restrict the seasonal component (PDQ = 0,0,0) for all models to prevent the algorithms from finding and overfitting to seasonal noise. To decide which model to proceed with, we will first train these models alongside an automated baseline (`auto_arima`) and then compare their Information Criteria (AIC and BIC) values. Models with lower information criteria indicate a better fit with less information loss.
+
+```{r, echo = FALSE}
+# Defining and training models with logarithmic transformation and disabled seasonality
+gdp_models <- gdp_train %>%
+  model(
+    arima_111  = ARIMA(log(values) ~ pdq(1, 1, 1) + PDQ(0, 0, 0)),
+    arima_310  = ARIMA(log(values) ~ pdq(3, 1, 0) + PDQ(0, 0, 0)),
+    arima_013  = ARIMA(log(values) ~ pdq(0, 1, 3) + PDQ(0, 0, 0)),
+    arima_313  = ARIMA(log(values) ~ pdq(3, 1, 3) + PDQ(0, 0, 0)),
+    auto_arima = ARIMA(log(values) ~ PDQ(0, 0, 0)) 
+  )
+
+# Comparing information criteria of the valid models
+gdp_models %>% 
+  glance() %>% 
+  select(.model, AIC, AICc, BIC) %>% 
+  arrange(BIC)
+```
+
+At first glance, the `arima_013` and `auto_arima` models appear to be the best choices as they have the lowest AIC and BIC scores. However, an evaluation of their coefficients is necessary to ensure if they are statistically valid. We also include `arima_310` as the third-best candidate for comparison.
+
+```{r,echo = FALSE}
+# Inspecting the statistical significance of coefficients for the best candidates
+gdp_models %>% 
+  select(auto_arima, arima_310, arima_013) %>% 
+  tidy()
+```
+
+Examining the coefficient summary, we see that the `auto_arima` model contains only a significant constant term.
+
+In our other models, we observed that the first and second lags were statistically insignificant, but the third lags (ar3 and ma3) were significant (p\<0.05). We attribute this to the COVID crisis of 2020 disrupting short-term normal economic cycles, leading to high variance and a sharp recovery.
+
+Finally, we decide to proceed with residual analysis using the auto, ARIMA(3,1,0) and ARIMA(0,1,3) models, which yield very similar p-values and IC results.
+
+### 4. Diagnostic Checking
+
+Although the `auto_arima` model presents a statistically significant constant term, its residual ACF plot reveals a significant spike crossing the confidence bound, indicating autocorrelated errors. Therefore, it fails the diagnostic checks.
+
+We then focused on the ARIMA(3,1,0) and ARIMA(0,1,3) models to better analyze the lagged economic shocks, particularly the disruptions caused by the COVID-19 crisis. For both models, all autocorrelations in the ACF plots fall within the 95% confidence limits. To confirm our visual findings, a Ljung-Box test was conducted. The test returned p-values of 0.710 for ARIMA(3,1,0) and 0.861 for ARIMA(0,1,3). Since both values are significantly higher than the 0.05 significance level, this confirms that the errors are purely random (White Noise). Even though ARIMA(0,1,3) has slightly betters statistics with higher Ljung-Box p-value and lower Information Criteria scores, we are going to take both models to see their performance metrics on forecasting.
+
+```{r, echo = FALSE}
+# Visual diagnostics for the candidate models
+gdp_models %>%
+  select(auto_arima) %>%
+  gg_tsresiduals() +
+  labs(title = "Residual Diagnostics: auto_arima (ARIMA(0,1,0) with drift)")
+
+gdp_models %>%
+  select(arima_310) %>%
+  gg_tsresiduals() +
+  labs(title = "Residual Diagnostics: ARIMA(3,1,0)")
+
+gdp_models %>%
+  select(arima_013) %>%
+  gg_tsresiduals() +
+  labs(title = "Residual Diagnostics: ARIMA(0,1,3)")
+
+# Ljung-Box test for white noise (lag = 8 for quarterly data, dof = 3)
+# We filter only the models with p+q=3 to correctly apply dof=3
+gdp_models %>%
+  select(arima_310, arima_013) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 8, dof = 3)
+# Ljung-Box test for auto_arima (ARIMA(0,1,0) -> p=0, q=0, dof=0)
+gdp_models %>%
+  select(auto_arima) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 8, dof = 0)
+```
+
+### 5. Out-of-Sample Evaluation
+
+To determine the most robust model for predicting future values, we evaluate the out-of-sample performance of both ARIMA(3,1,0) and ARIMA(0,1,3). We use our holdout `gdp_test` dataset (2023 Q1 - 2024 Q4) to generate an 8-quarter forecast and calculate error metrics, particularly Root Mean Squared Error (RMSE) and Mean Absolute Percentage Error (MAPE). We also visually inspect the forecast against the actual historical data.
+
+```{r, echo = FALSE}
+# Forecasting the test period using the candidate models
+test_forecast <- gdp_models %>%
+  select(arima_310, arima_013) %>%
+  forecast(new_data = gdp_test)
+
+# Calculating performance metrics against the actual test data
+test_forecast %>%
+  accuracy(gdp_tsibble) %>%
+  select(.model, RMSE, MAE, MAPE) %>%
+  arrange(RMSE)
+
+# Visualizing the forecasts against actual test data
+
+test_forecast %>%
+  autoplot(gdp_tsibble %>% filter(year(quarter) >= 2018), level = NULL) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Out-of-Sample Forecasts vs Actual GDP",
+       subtitle = "Evaluating model accuracy on the holdout set (2023-2024)",
+       y = "GDP (Million EUR)", x = "Quarter")
+```
+
+The error metrics revealed that while even though ARIMA(0,1,3) had a better in-sample fit, ARIMA(3,1,0) outperformed it in out-of-sample testing with a lower RMSE and a MAPE of approximately 5.15%
+
+However, the visual plot indicates that both models underpredicted the steep trajectory of the actual GDP during 2023-2024. This divergence can be attributed to the massive post-COVID inflation shock experienced across Europe. Because our dataset uses Current Prices (nominal GDP), the sharp rise in actual GDP reflects inflated price levels rather than pure economic output. Univariate ARIMA models naturally struggle to capture such exogenous macroeconomic shocks without external regressors. Despite this limitation, we select **ARIMA(3,1,0)** as our final champion due to its superior predictive accuracy on unseen data.
+
+### 6. Final Forecast and Economic Implications (2026-2028)
+
+Having validated ARIMA(3,1,0) as our most reliable predictive model, we now refit it using the entire historical dataset (`gdp_tsibble`) to maximize our information base before forecasting the next three years (2026 Q1 - 2028 Q4).
+
+We also derive the annual nominal GDP growth rates from our point forecasts. This enables a direct comparison with institutional projections from bodies like the European Commission and the IMF.
+
+```{r, echo = FALSE}
+
+# 1. Refitting the best model
+champion_model <- gdp_tsibble %>%
+  model(arima_310 = ARIMA(log(values) ~ pdq(3, 1, 0) + PDQ(0, 0, 0)))
+
+# 2. Generating a 3-year forecast 
+gdp_forecast <- champion_model %>%
+  forecast(h = "3 years")
+
+# 3. Extracting historical and forecasted values into a single timeline
+historical_gdp <- gdp_tsibble %>% 
+  as_tibble() %>% 
+  select(quarter, values)
+
+forecast_gdp <- gdp_forecast %>% 
+  as_tibble() %>% 
+  select(quarter, values = .mean)
+
+combined_gdp <- bind_rows(historical_gdp, forecast_gdp) %>% 
+  arrange(quarter)
+
+# 4. Calculating Annual Growth (
+annual_growth <- combined_gdp %>%
+  mutate(year = as.numeric(substr(as.character(quarter), 1, 4))) %>%
+  group_by(year) %>%
+  summarise(annual_gdp = sum(values)) %>%
+  mutate(annual_growth_pct = (annual_gdp / lag(annual_gdp, 1) - 1) * 100) %>%
+  filter(year >= 2025)
+
+print("Annual Nominal GDP Growth Rates:")
+print(annual_growth)
+```
+
+### 7. Comparison with Institutional Forecasts
+
+To evaluate the validity and robustness of our ARIMA(3,1,0) model, we compared its out-of-sample projections against the macroeconomic forecasts published by leading authorities, including the European Commission, Banco de Portugal, CFP, OECD, IMF, and Statista.
+
+Since these institutions primarily publish *real* GDP growth expectations, we had to compute the implied *nominal* GDP growth to make them directly comparable with our model, which is trained on current prices (nominal terms). To bridge this gap, we incorporated the European Commission's inflation projections. Specifically, we applied the Commission's projected inflation rates—estimated at approximately 3.0% for 2026, and 2.3% for 2027—to the institutions' real growth rates.
+
+```{r, echo = FALSE}
+# --- 1. PREPARING SIMPLE TREND LINES FOR INSTITUTIONS ---
+
+# Taking the last data point we have as a reference (2025 Q4)
+base_val <- gdp_tsibble$values[nrow(gdp_tsibble)]
+base_qtr <- gdp_tsibble$quarter[nrow(gdp_tsibble)]
+
+# Institutions' Nominal Growth Calculation (Real + Inflation)
+inst_forecasts <- tibble(
+  Forecaster = c("Commission", "Banco PT", "CFP", "OECD", "IMF", "Statista"),
+  Nominal_2026 = ((1 + c(1.7, 1.8, 1.6, 2.2, 1.9, 1.93)/100) * 1.03) - 1,
+  Nominal_2027 = ((1 + c(1.8, 1.6, 1.8, 1.8, 1.8, 1.8)/100) * 1.023) - 1
+) %>%
+  mutate(
+    # Adding growth to the baseline to find 2026 and 2027 targets
+    Target_2026 = base_val * (1 + Nominal_2026),
+    Target_2027 = Target_2026 * (1 + Nominal_2027)
+  )
+
+# Reshaping the data and connecting the starting point for plotting
+plot_data <- inst_forecasts %>%
+  select(Forecaster, Target_2026, Target_2027) %>%
+  pivot_longer(cols = starts_with("Target"), names_to = "Year", values_to = "values") %>%
+  # Assigning points to Q4 to align the X-axis and create straight lines
+  mutate(quarter = if_else(Year == "Target_2026", yearquarter("2026 Q4"), yearquarter("2027 Q4")))
+
+anchor_data <- tibble(Forecaster = unique(plot_data$Forecaster), Year = "Base", values = base_val, quarter = base_qtr)
+final_plot_data <- bind_rows(anchor_data, plot_data)
+```
+
+```{r, echo = FALSE}
+# --- 2. FORECAST COMPARISON GRAPH  ---
+
+# Filtering historical data from 2024 Q1 onwards to naturally narrow the Y-axis 
+gdp_forecast %>%
+  autoplot(gdp_tsibble %>% filter(quarter >= yearquarter("2024 Q1")), level = NULL, linewidth = 1.2) + 
+  
+  # Adding a named copy of our forecast to include it in the legend
+  geom_line(data = gdp_forecast %>% as_tibble(), 
+            aes(x = quarter, y = .mean, color = "Our ARIMA(3,1,0)"), 
+            linewidth = 1.2) +
+  
+  # Institutional forecasts
+  geom_line(data = final_plot_data, aes(x = quarter, y = values, color = Forecaster), 
+            linewidth = 0.8, linetype = "dashed") +
+  
+  scale_y_continuous(labels = comma) +
+  
+  labs(
+    title = "Portugal GDP Forecast: ARIMA vs. Institutional Forecasters",
+    subtitle = "Zoomed baseline trajectories based on derived nominal growth expectations",
+    x = "Year / Quarter",
+    y = "GDP (Current Prices, Million EUR)",
+    color = "Forecaster"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The results from the graph below suggest a clear trend, the growth path predicted by our ARIMA(3,1,0) model (trained solely on historical data) aligns relatively well with the forecasts of international institutions (dashed lines). It is encouraging to see that a straightforward univariate model can produce a trajectory similar to the more complex models used by major institutions, indicating that our forecast provides a reasonable baseline.
+
+```{r, echo = FALSE}
+# --- 3. SIMPLE BAR PLOT (ARIMA vs INSTITUTIONS) ---
+
+# Extract our ARIMA growth rates for 2026 and 2027
+arima_26 <- round(annual_growth$annual_growth_pct[annual_growth$year == 2026], 2)
+arima_27 <- round(annual_growth$annual_growth_pct[annual_growth$year == 2027], 2)
+
+# Real growth rates from institutions (Commission, Banco PT, CFP, OECD, IMF, Statista)
+real_26 <- c(1.7, 1.8, 1.6, 2.2, 1.9, 1.93)
+real_27 <- c(1.8, 1.6, 1.8, 1.8, 1.8, 1.8)
+
+# Build the comparison table (converting real to nominal)
+comparison_data <- tibble(
+  Forecaster = c("Our ARIMA", "Commission", "Banco PT", "CFP", "OECD", "IMF", "Statista"),
+  `2026` = c(arima_26, round(((1 + real_26/100) * 1.03 - 1) * 100, 2)),
+  `2027` = c(arima_27, round(((1 + real_27/100) * 1.023 - 1) * 100, 2))
+)
+
+# Convert data to long format for ggplot plotting
+comparison_long <- comparison_data %>%
+  pivot_longer(cols = c(`2026`, `2027`), names_to = "Year", values_to = "Growth")
+
+# Plot the grouped bar chart
+ggplot(comparison_long, aes(x = Year, y = Growth, fill = Forecaster)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, color = "black") +
+  geom_text(aes(label = Growth), position = position_dodge(width = 0.8), vjust = -0.5, size = 3.5) +
+  labs(
+    title = "Nominal GDP Growth Projections (%)",
+    subtitle = "Our ARIMA(3,1,0) vs. Master Forecasters",
+    x = "Year",
+    y = "Nominal Growth Rate (%)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.title = element_blank())
+```
+
+Looking at the annual nominal growth rates, the results are clear. For 2026, our model offers a slightly optimistic forecast of around 5.5%, which is just above institutional expectations (4.65%–5.27%). More interestingly, for 2027, our model reflects the general deceleration trend expected by international authorities, with the predicted rate adjusting to 4.47%. This suggests that the model is capable of picking up on broader macroeconomic slowdowns, rather than just projecting a continuous upward trend.
+
+### 8. Conclusion
+
+In summary, our ARIMA(3,1,0) model captures the fundamental autoregressive dynamics of Portugal’s GDP, providing a reasonable baseline projection for the near future. Our model demonstrated its reliability by achieving a Mean Absolute Percentage Error (MAPE) of approximately 5% in out-of-sample performance during the testing phase. When we compare our results with the European Commission’s real growth and inflation forecasts—which indicate nominal growth targets ranging from 4.1% to 4.7% for the coming years—we observe that our model’s outputs show a reasonable level of alignment. Although univariate time series analysis inherently has limitations in forecasting sudden exogenous shocks, this project highlights that the Box-Jenkins methodology can still be effectively used as a practical and data-driven tool for observing macroeconomic trends and establishing a basic forecasting framework.
+
+### References
+
+- **Banco de Portugal.** (n.d.). *Economic Projections*. Retrieved from <https://www.bportugal.pt/en/page/economic-projections>
+
+- **European Commission.** (n.d.). *Economic forecast for Portugal*. Retrieved from <https://economy-finance.ec.europa.eu/economic-surveillance-eu-member-states/country-pages/portugal/economic-forecast-portugal_en>
+
+- **International Monetary Fund (IMF).** (n.d.). *Real GDP growth (Annual percent change) - Portugal*. IMF DataMapper. Retrieved from [https://www.imf.org/external/datamapper/NGDP_RPCH\@WEO/PRT?zoom=PRT&highlight=PRT](https://www.imf.org/external/datamapper/NGDP_RPCH@WEO/PRT?zoom=PRT&highlight=PRT)
+
+- **Organisation for Economic Co-operation and Development (OECD).** (2026). *OECD Economic Surveys: Portugal 2026*. Retrieved from <https://www.oecd.org/en/publications/oecd-economic-surveys-portugal-2026_025b3445-en.html>
+
+- **Portuguese Public Finance Council (CFP).** (n.d.). *Economic and Fiscal Outlook 2026-2030*. Retrieved from <https://www.cfp.pt/en/publications/economic-and-fiscal-outlook/economic-and-fiscal-outlook-2026-2030>
+
+- **Statista.** (n.d.). *Gross domestic product (GDP) growth rate in Portugal*. Retrieved from <https://www.statista.com/statistics/372306/gross-domestic-product-gdp-growth-rate-in-portugal/>
